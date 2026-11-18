@@ -243,6 +243,7 @@ fn listener_context() -> (
             device_managers: Arc::new(RwLock::new(HashMap::new())),
             config: config::Config::default(),
             reconnect_tx,
+            head_motion: Default::default(),
         },
         app_rx,
     )

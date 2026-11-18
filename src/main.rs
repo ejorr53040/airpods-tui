@@ -56,6 +56,11 @@ struct Args {
         help = "Run as headless daemon (no TUI, just maintain connections)"
     )]
     daemon: bool,
+    #[arg(
+        long,
+        help = "Print live head motion from the daemon (timestamp_ns w x y z) until Ctrl+C"
+    )]
+    head_watch: bool,
 }
 
 const DBUS_METHOD_TIMEOUT: Duration = Duration::from_secs(5);
@@ -206,6 +211,10 @@ fn main() -> io::Result<()> {
         .target(env_logger::Target::Stderr)
         .init();
 
+    if args.head_watch {
+        return run_head_watch();
+    }
+
     check_bluetooth_config();
 
     let config = config::Config::load();
@@ -237,7 +246,8 @@ fn main() -> io::Result<()> {
             tokio::spawn(async move {
                 let mut battery_alerted: HashMap<String, u8> = HashMap::new();
                 while let Some(event) = app_rx.recv().await {
-                    {
+                    // 50 per second while streaming, and never replayed.
+                    if !event.is_head_motion() {
                         let mut snap = snapshot_clone.write().await;
                         ipc::update_snapshot(&mut snap, &event);
                     }
@@ -412,6 +422,64 @@ fn main() -> io::Result<()> {
     terminal.show_cursor()?;
 
     Ok(())
+}
+
+/// Ask the daemon for head motion and print it: one `timestamp_ns w x y z`
+/// line per sample, `motion ended: <reason>` when it stops.
+fn run_head_watch() -> io::Result<()> {
+    use crate::bluetooth::aacp::AACPEvent;
+    use io::Write;
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let (cmd_tx, mut events) = match ipc::ipc_connect().await {
+            Ok(connection) => connection,
+            Err(e) => {
+                eprintln!(
+                    "--head-watch needs the airpods-tui daemon ({e}); start it with \
+                     `systemctl --user start airpods-tui`"
+                );
+                std::process::exit(1);
+            }
+        };
+        let _ = cmd_tx.send(("*".into(), crate::tui::app::DeviceCommand::HeadMotion(true)));
+        eprintln!("Waiting for head motion, Ctrl+C to stop");
+
+        let mut out = io::stdout().lock();
+        let ctrl_c = tokio::signal::ctrl_c();
+        tokio::pin!(ctrl_c);
+        loop {
+            let event = tokio::select! {
+                event = events.recv() => event,
+                _ = &mut ctrl_c => break,
+            };
+            let Some(event) = event else {
+                eprintln!("The daemon closed the connection");
+                break;
+            };
+            let AppEvent::AACPEvent(_, event) = event else {
+                continue;
+            };
+            let written = match *event {
+                AACPEvent::HeadMotion(sample) => {
+                    let [w, x, y, z] = sample.quaternion;
+                    writeln!(
+                        out,
+                        "{} {w:.5} {x:.5} {y:.5} {z:.5}",
+                        sample.timestamp_ns
+                    )
+                }
+                AACPEvent::HeadMotionEnded(reason) => writeln!(out, "motion ended: {reason:?}"),
+                _ => continue,
+            };
+            // A closed pipe (`| head`) ends the watch.
+            if written.is_err() {
+                break;
+            }
+        }
+        // Leaving closes the connection, which withdraws the request.
+        Ok(())
+    })
 }
 
 fn run_waybar_mode(watch: bool) -> io::Result<()> {
@@ -683,6 +751,7 @@ async fn bluez_connection_listener(
     devices_list: HashMap<String, DeviceData>,
     config: config::Config,
     reconnect_tx: tokio::sync::mpsc::UnboundedSender<(Address, u16)>,
+    head_motion: Arc<tokio::sync::Mutex<bool>>,
 ) -> zbus::Result<()> {
     // A separate socket receives method replies even if the signal socket is
     // back-pressured. Property calls also have a finite timeout.
@@ -697,6 +766,7 @@ async fn bluez_connection_listener(
             device_managers,
             config,
             reconnect_tx,
+            head_motion,
         },
     )
     .await
@@ -834,6 +904,9 @@ struct AirPodsInitContext {
     device_managers: Arc<RwLock<HashMap<String, DeviceManagers>>>,
     config: config::Config,
     reconnect_tx: tokio::sync::mpsc::UnboundedSender<(Address, u16)>,
+    /// Whether an IPC client wants head motion. Held while sessions are
+    /// started or stopped, so a session finishing init cannot miss a change.
+    head_motion: Arc<tokio::sync::Mutex<bool>>,
 }
 
 enum InitOutcome {
@@ -880,12 +953,19 @@ async fn try_airpods_init(
     .await
     {
         Ok(airpods_device) => {
+            let aacp = airpods_device.aacp_manager;
             let mut managers = ctx.device_managers.write().await;
             managers
                 .entry(addr_str.clone())
-                .and_modify(|dm| dm.set_aacp(airpods_device.aacp_manager.clone()))
-                .or_insert_with(|| DeviceManagers::with_aacp(airpods_device.aacp_manager));
+                .and_modify(|dm| dm.set_aacp(aacp.clone()))
+                .or_insert_with(|| DeviceManagers::with_aacp(aacp.clone()));
             drop(managers);
+            // Sessions that come up while a client wants motion stream too.
+            let head_motion_wanted = ctx.head_motion.lock().await;
+            if *head_motion_wanted {
+                aacp.start_head_motion().await;
+            }
+            drop(head_motion_wanted);
             // Notify the TUI only once AACP is alive. The handle_aacp_event
             // path auto-creates a placeholder device entry if any AACP event
             // arrived during init, so this ordering is safe.
@@ -971,10 +1051,36 @@ async fn bluetooth_main(
     }
 
     // Command dispatcher - receives (mac, DeviceCommand) from TUI
+    let head_motion = Arc::new(tokio::sync::Mutex::new(false));
     let dm_cmd = device_managers.clone();
     let adapter_cmd = adapter.clone();
+    let head_motion_cmd = head_motion.clone();
     tokio::spawn(async move {
         while let Some((mac, cmd)) = cmd_rx.recv().await {
+            // Global: every session streams while any IPC client asks.
+            if let tui::app::DeviceCommand::HeadMotion(on) = cmd {
+                let mut wanted = head_motion_cmd.lock().await;
+                *wanted = on;
+                let sessions: Vec<_> = dm_cmd
+                    .read()
+                    .await
+                    .values()
+                    .filter_map(|dm| dm.get_aacp())
+                    .collect();
+                info!(
+                    "Head motion {} on {} session(s)",
+                    if on { "requested" } else { "no longer requested" },
+                    sessions.len()
+                );
+                for aacp in sessions {
+                    if on {
+                        aacp.start_head_motion().await;
+                    } else {
+                        aacp.stop_head_motion().await;
+                    }
+                }
+                continue;
+            }
             // Not held across the awaits below: a rename retries for up to
             // 1.5 s, and inits and reconnects need the write lock meanwhile.
             let aacp = dm_cmd.read().await.get(&mac).and_then(|dm| dm.get_aacp());
@@ -1005,6 +1111,7 @@ async fn bluetooth_main(
                             }
                         }
                     }
+                    tui::app::DeviceCommand::HeadMotion(_) => {} // global, handled above
                 }
             }
         }
@@ -1022,6 +1129,7 @@ async fn bluetooth_main(
         let reconnect_tx = reconnect_tx.clone();
         let dl = devices_list.clone();
         let adapter = adapter.clone();
+        let head_motion = head_motion.clone();
         tokio::spawn(async move {
             while let Some((addr, product_id)) = reconnect_rx.recv().await {
                 let addr_str = addr.to_string();
@@ -1050,6 +1158,7 @@ async fn bluetooth_main(
                     device_managers: dm.clone(),
                     config: cfg.clone(),
                     reconnect_tx: reconnect_tx.clone(),
+                    head_motion: head_motion.clone(),
                 };
                 let mut attempt: u32 = 0;
                 loop {
@@ -1095,7 +1204,10 @@ async fn bluetooth_main(
         let dl = devices_list.clone();
         let cfg = config.clone();
         let rtx = reconnect_tx.clone();
-        tokio::spawn(async move { bluez_connection_listener(conn, app_tx, dm, dl, cfg, rtx).await })
+        let hm = head_motion.clone();
+        tokio::spawn(
+            async move { bluez_connection_listener(conn, app_tx, dm, dl, cfg, rtx, hm).await },
+        )
     };
 
     // Now check for already-connected devices (listener is already active)
@@ -1139,6 +1251,7 @@ async fn bluetooth_main(
                     device_managers: device_managers.clone(),
                     config: config.clone(),
                     reconnect_tx: reconnect_tx.clone(),
+                    head_motion: head_motion.clone(),
                 },
             );
         }

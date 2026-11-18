@@ -37,7 +37,25 @@ A terminal UI for managing AirPods on Linux, built for [Omarchy](https://omarchy
 - **Battery and in-ear state without a connection**, decoded from Apple's BLE proximity advertisements: the daemon keeps reporting while the buds sit in the case or belong to your iPhone, where the control channel has nothing to say. Battery comes back per-percent rather than in 10% steps
 - **Waybar integration** via JSON output (`--waybar` / `--waybar-watch`)
 - **Background daemon** with Unix-socket IPC so the TUI launches instantly
+- **Head motion** (AirPods Max, verified): head orientation streamed to IPC clients that ask, with `--head-watch` printing live samples. See [Head motion](#head-motion)
 - **28 Apple/Beats models** with per-model capability detection; unknown Apple devices fall back to safe defaults
+
+## Head motion
+
+The daemon can stream head orientation from the AirPods (AirPods Max verified; other RemoteHID models may work) to IPC clients that ask for it. `airpods-tui --head-watch` prints live samples.
+
+Clients opt in by sending `["*",{"HeadMotion":true}]` (and `false` to stop). Only the asking clients receive these events, and streaming runs at 50 Hz only while someone asks:
+
+```json
+{"AACPEvent":[mac,{"HeadMotion":{"timestamp_ns":123,"quaternion":[w,x,y,z]}}]}
+{"AACPEvent":[mac,{"HeadMotionEnded":"OffHead"}]}
+```
+
+`HeadMotionEnded` carries `OffHead`, `Disconnected`, or `Unavailable`.
+
+Caveat: the AirPods announce no motion sensor while another Apple device shares them, or after a link drop. To recover, turn off Bluetooth on the other device and reconnect the AirPods.
+
+Credit: the RemoteHID findings come from [MousePods](https://github.com/starman-tech/mousepods) by Matteo Gaudioso (starman-tech), licensed CC BY 4.0.
 
 ## Installation
 

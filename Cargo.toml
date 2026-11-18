@@ -25,6 +25,9 @@ serde_repr = "0.1"
 aes = "0.9.3"
 cbc = "0.2.1"
 
+[dev-dependencies]
+tokio = { version = "1.47.1", features = ["test-util"] }
+
 [profile.release]
 opt-level = "s"
 lto = true

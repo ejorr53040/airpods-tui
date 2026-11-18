@@ -13,6 +13,9 @@ pub enum DeviceCommand {
     Rename(String),
     /// A daemon setting rather than an AirPods one: see `DeviceData::single_pod`.
     SetSinglePod(bool),
+    /// Ask for head motion (`true`) or stop asking (`false`). Global, not
+    /// per device: the mac is ignored, `"*"` by convention.
+    HeadMotion(bool),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,6 +35,15 @@ pub enum AppEvent {
     },
     AACPEvent(String, Box<crate::bluetooth::aacp::AACPEvent>),
     AudioUnavailable,
+}
+
+impl AppEvent {
+    /// Head-motion events go only to clients that asked for them and are
+    /// never replayed.
+    pub fn is_head_motion(&self) -> bool {
+        matches!(self, AppEvent::AACPEvent(_, e)
+            if matches!(**e, AACPEvent::HeadMotion(_) | AACPEvent::HeadMotionEnded(_)))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -492,6 +504,8 @@ impl App {
                     self.selected_device_idx = self.device_order.len() - 1;
                 }
             }
+            // Motion is for clients that asked (--head-watch, other apps).
+            AppEvent::AACPEvent(..) if event.is_head_motion() => {}
             AppEvent::AACPEvent(mac, event) => {
                 self.handle_aacp_event(&mac, *event);
             }

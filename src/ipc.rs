@@ -1,7 +1,8 @@
 use crate::tui::app::{AppEvent, DeviceCommand};
 use log::{error, info};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{RwLock, broadcast, mpsc};
@@ -156,6 +157,37 @@ pub struct IpcServer {
     snapshot: StateSnapshot,
     broadcast_tx: broadcast::Sender<AppEvent>,
     cmd_tx: mpsc::UnboundedSender<(String, DeviceCommand)>,
+    head_motion: Arc<MotionDemand>,
+}
+
+/// Clients asking for head motion. When their count crosses zero the
+/// dispatcher gets `("*", HeadMotion(on))` to start or stop every session.
+struct MotionDemand {
+    clients: std::sync::Mutex<usize>,
+    cmd_tx: mpsc::UnboundedSender<(String, DeviceCommand)>,
+}
+
+impl MotionDemand {
+    /// Record whether one client asks; `asking` is that client's flag.
+    fn set(&self, asking: &AtomicBool, on: bool) {
+        let mut clients = self.clients.lock().unwrap_or_else(|e| e.into_inner());
+        if asking.swap(on, Ordering::SeqCst) == on {
+            return;
+        }
+        let crossed_zero = if on {
+            *clients += 1;
+            *clients == 1
+        } else {
+            *clients -= 1;
+            *clients == 0
+        };
+        if crossed_zero {
+            info!("Head motion {}", if on { "requested" } else { "released" });
+            let _ = self
+                .cmd_tx
+                .send(("*".into(), DeviceCommand::HeadMotion(on)));
+        }
+    }
 }
 
 impl IpcServer {
@@ -167,6 +199,10 @@ impl IpcServer {
         Self {
             snapshot,
             broadcast_tx,
+            head_motion: Arc::new(MotionDemand {
+                clients: std::sync::Mutex::new(0),
+                cmd_tx: cmd_tx.clone(),
+            }),
             cmd_tx,
         }
     }
@@ -178,21 +214,25 @@ impl IpcServer {
 
     /// Run the IPC server, accepting connections on the Unix socket.
     pub async fn run(&self) -> std::io::Result<()> {
-        let path = socket_path()?;
+        self.serve(&socket_path()?).await
+    }
+
+    /// Accept connections on the Unix socket at `path`.
+    pub async fn serve(&self, path: &Path) -> std::io::Result<()> {
         // Remove stale socket - ignore NotFound, log other errors
-        if let Err(e) = std::fs::remove_file(&path)
+        if let Err(e) = std::fs::remove_file(path)
             && e.kind() != std::io::ErrorKind::NotFound
         {
             log::warn!("Failed to remove stale socket {}: {}", path.display(), e);
         }
 
-        let listener = UnixListener::bind(&path)?;
+        let listener = UnixListener::bind(path)?;
 
         // Restrict socket to owner-only access
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
             {
                 log::warn!("Failed to set socket permissions: {}", e);
             }
@@ -206,6 +246,9 @@ impl IpcServer {
             let snapshot = self.snapshot.clone();
             let mut event_rx = self.broadcast_tx.subscribe();
             let cmd_tx = self.cmd_tx.clone();
+            let head_motion = self.head_motion.clone();
+            // Whether this client asked for head motion.
+            let asking = Arc::new(AtomicBool::new(false));
 
             tokio::spawn(async move {
                 let (reader, writer) = stream.into_split();
@@ -241,10 +284,15 @@ impl IpcServer {
 
                 // Forward broadcast events
                 let write_tx_clone = write_tx.clone();
+                let forward_asking = asking.clone();
                 let event_forward = tokio::spawn(async move {
                     loop {
                         match event_rx.recv().await {
                             Ok(event) => {
+                                if event.is_head_motion() && !forward_asking.load(Ordering::SeqCst)
+                                {
+                                    continue;
+                                }
                                 if let Ok(json) = serde_json::to_vec(&event)
                                     && write_tx_clone.send(json).is_err()
                                 {
@@ -262,6 +310,7 @@ impl IpcServer {
                 // Read commands from client
                 while let Ok(data) = read_msg(&mut reader).await {
                     match serde_json::from_slice::<(String, DeviceCommand)>(&data) {
+                        Ok((_, DeviceCommand::HeadMotion(on))) => head_motion.set(&asking, on),
                         Ok(cmd) => {
                             let _ = cmd_tx.send(cmd);
                         }
@@ -272,6 +321,7 @@ impl IpcServer {
                 }
 
                 info!("IPC client disconnected");
+                head_motion.set(&asking, false);
                 event_forward.abort();
                 writer_handle.abort();
             });
@@ -285,8 +335,17 @@ pub async fn ipc_connect() -> std::io::Result<(
     mpsc::UnboundedSender<(String, DeviceCommand)>,
     mpsc::UnboundedReceiver<AppEvent>,
 )> {
-    let path = socket_path()?;
-    let stream = UnixStream::connect(&path).await?;
+    ipc_connect_to(&socket_path()?).await
+}
+
+/// Connect to a daemon listening at `path`.
+pub async fn ipc_connect_to(
+    path: &Path,
+) -> std::io::Result<(
+    mpsc::UnboundedSender<(String, DeviceCommand)>,
+    mpsc::UnboundedReceiver<AppEvent>,
+)> {
+    let stream = UnixStream::connect(path).await?;
     info!("Connected to IPC daemon at {}", path.display());
 
     let (reader, writer) = stream.into_split();
@@ -339,8 +398,11 @@ mod tests {
     use crate::bluetooth::aacp::{
         AACPEvent as AE, AudioSource, AudioSourceType, BatteryComponent, BatteryInfo,
         BatteryStatus, ConnectedDevice, ControlCommandIdentifiers, ControlCommandStatus,
-        EarDetectionStatus, StemPressBudType, StemPressType,
+        EarDetectionStatus, HeadMotionEnd, HeadMotionSample, StemPressBudType, StemPressType,
     };
+    use std::time::Duration;
+    use tokio::sync::mpsc::UnboundedReceiver;
+    use tokio::time::timeout;
 
     const MAC_A: &str = "AA:BB:CC:DD:EE:FF";
     const MAC_B: &str = "11:22:33:44:55:66";
@@ -747,5 +809,164 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    fn motion_event(mac: &str) -> AppEvent {
+        AppEvent::AACPEvent(
+            mac.into(),
+            Box::new(AE::HeadMotion(HeadMotionSample {
+                timestamp_ns: 123,
+                quaternion: [1.0, 0.0, 0.0, 0.0],
+            })),
+        )
+    }
+
+    #[test]
+    fn snapshot_never_stores_head_motion() {
+        let mut snap = Vec::new();
+        update_snapshot(&mut snap, &motion_event(MAC_A));
+        update_snapshot(
+            &mut snap,
+            &AppEvent::AACPEvent(
+                MAC_A.into(),
+                Box::new(AE::HeadMotionEnded(HeadMotionEnd::OffHead)),
+            ),
+        );
+        assert!(snap.is_empty(), "{snap:?}");
+    }
+
+    #[test]
+    fn head_motion_has_the_agreed_wire_shape() {
+        assert_eq!(
+            serde_json::to_string(&motion_event("08:FF")).unwrap(),
+            r#"{"AACPEvent":["08:FF",{"HeadMotion":{"timestamp_ns":123,"quaternion":[1.0,0.0,0.0,0.0]}}]}"#
+        );
+        let ended = AppEvent::AACPEvent(
+            "08:FF".into(),
+            Box::new(AE::HeadMotionEnded(HeadMotionEnd::OffHead)),
+        );
+        assert_eq!(
+            serde_json::to_string(&ended).unwrap(),
+            r#"{"AACPEvent":["08:FF",{"HeadMotionEnded":"OffHead"}]}"#
+        );
+        let cmd: (String, DeviceCommand) =
+            serde_json::from_str(r#"["*",{"HeadMotion":true}]"#).unwrap();
+        assert!(matches!(cmd.1, DeviceCommand::HeadMotion(true)));
+    }
+
+    /// The real server on a socket in its own runtime directory, with one
+    /// device in the snapshot so a client knows it has been accepted once
+    /// the replay arrives.
+    async fn start_server(
+        name: &str,
+    ) -> (
+        Arc<IpcServer>,
+        UnboundedReceiver<(String, DeviceCommand)>,
+        PathBuf,
+    ) {
+        let dir =
+            std::env::temp_dir().join(format!("airpods-tui-ipc-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("airpods-tui.sock");
+        let snapshot: StateSnapshot = Arc::new(RwLock::new(vec![AppEvent::DeviceConnected {
+            mac: MAC_A.into(),
+            name: "Max".into(),
+            product_id: 0x200a,
+        }]));
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let server = Arc::new(IpcServer::new(snapshot, cmd_tx));
+        let serving = server.clone();
+        let serve_path = path.clone();
+        tokio::spawn(async move { serving.serve(&serve_path).await });
+        (server, cmd_rx, path)
+    }
+
+    type Client = (
+        mpsc::UnboundedSender<(String, DeviceCommand)>,
+        UnboundedReceiver<AppEvent>,
+    );
+
+    async fn connect(path: &std::path::Path) -> Client {
+        for _ in 0..200 {
+            if let Ok((cmd_tx, mut events)) = ipc_connect_to(path).await {
+                assert!(matches!(
+                    next(&mut events).await,
+                    Some(AppEvent::DeviceConnected { .. })
+                ));
+                return (cmd_tx, events);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("server never listened on {}", path.display());
+    }
+
+    async fn next<T>(rx: &mut UnboundedReceiver<T>) -> Option<T> {
+        timeout(Duration::from_secs(2), rx.recv()).await.ok().flatten()
+    }
+
+    /// Nothing arrives within a short window.
+    async fn quiet<T: std::fmt::Debug>(rx: &mut UnboundedReceiver<T>) {
+        if let Ok(Some(x)) = timeout(Duration::from_millis(200), rx.recv()).await {
+            panic!("unexpected {x:?}");
+        }
+    }
+
+    fn ask(client: &Client, on: bool) {
+        client
+            .0
+            .send(("*".into(), DeviceCommand::HeadMotion(on)))
+            .unwrap();
+    }
+
+    fn assert_demand(cmd: Option<(String, DeviceCommand)>, on: bool) {
+        assert!(
+            matches!(&cmd, Some((_, DeviceCommand::HeadMotion(o))) if *o == on),
+            "expected demand {on}, got {cmd:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_clients_that_ask_receive_head_motion() {
+        let (server, mut demand, path) = start_server("forward").await;
+        let asker = connect(&path).await;
+        let mut other = connect(&path).await;
+        ask(&asker, true);
+        assert_demand(next(&mut demand).await, true);
+        let mut asker = asker;
+
+        let battery = battery_event(MAC_A, vec![]);
+        server.broadcast(&motion_event(MAC_A));
+        server.broadcast(&battery);
+        assert!(next(&mut asker.1).await.unwrap().is_head_motion());
+        assert!(!next(&mut asker.1).await.unwrap().is_head_motion());
+        // The other client gets the battery report and nothing before it.
+        assert!(matches!(
+            next(&mut other.1).await,
+            Some(AppEvent::AACPEvent(_, e)) if matches!(*e, AE::BatteryInfo(_))
+        ));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn demand_lasts_until_the_last_asking_client_is_gone() {
+        let (_server, mut demand, path) = start_server("demand").await;
+        let first = connect(&path).await;
+        let second = connect(&path).await;
+
+        ask(&first, true);
+        assert_demand(next(&mut demand).await, true);
+        // Asking twice counts once; a second asker changes nothing.
+        ask(&first, true);
+        ask(&second, true);
+        quiet(&mut demand).await;
+
+        ask(&first, false);
+        quiet(&mut demand).await;
+        // The last asker disconnecting turns demand off.
+        drop(second);
+        assert_demand(next(&mut demand).await, false);
+        quiet(&mut demand).await;
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

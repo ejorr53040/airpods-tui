@@ -1,3 +1,4 @@
+use crate::bluetooth::remote_hid::{self, SubPacket};
 use crate::devices::airpods::AirPodsInformation;
 use crate::devices::enums::{DeviceData, DeviceInformation, DeviceType};
 use crate::utils::get_devices_path;
@@ -19,6 +20,18 @@ const PSM: u16 = 0x1001;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 const HEADER_BYTES: [u8; 4] = [0x04, 0x00, 0x04, 0x00];
+/// The receive MTU iOS uses. At Linux's default (672) the AirPods never
+/// announce their motion sensors: devmotion6's announcement is 833 bytes.
+const RECV_MTU: u16 = 2582;
+
+/// The fused-motion sensor that reports head orientation.
+const HEAD_MOTION_SERVICE: &str = "devmotion6";
+/// Report interval while streaming: 20 000 µs, 50 Hz.
+const HEAD_MOTION_INTERVAL_US: u32 = 20_000;
+/// HostConnect is sent once more if devmotion6 has not announced itself by
+/// then, and motion reported unavailable if it still has not by the timeout.
+const HOST_CONNECT_RETRY: Duration = Duration::from_secs(2);
+const MOTION_ANNOUNCE_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub mod opcodes {
     pub const SET_FEATURE_FLAGS: u8 = 0x4D;
@@ -36,6 +49,8 @@ pub mod opcodes {
     pub const AUDIO_SOURCE: u8 = 0x0E;
     /// Relayed by the AirPods to another connected Apple device.
     pub const SMART_ROUTING: u8 = 0x10;
+    /// RTBuddy; descriptor 0x800 carries RemoteHID (see `remote_hid`).
+    pub const REMOTE_HID: u8 = 0x17;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -231,6 +246,33 @@ pub enum AACPEvent {
     /// Whether the device is used one pod at a time (a daemon setting,
     /// remembered per device, not an AirPods one).
     SinglePod(bool),
+    /// One head-motion sample while motion is streaming. Only motion
+    /// clients see it, and it never enters the replay snapshot.
+    HeadMotion(HeadMotionSample),
+    /// Motion stopped flowing for the given reason.
+    HeadMotionEnded(HeadMotionEnd),
+}
+
+/// Head orientation from the AirPods' fused motion sensor (`devmotion6`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct HeadMotionSample {
+    /// The AirPods' own clock, nanoseconds.
+    pub timestamp_ns: u64,
+    /// Attitude as a unit quaternion `[w, x, y, z]`, device to world, world
+    /// Z up, w reconstructed as the positive root.
+    pub quaternion: [f32; 4],
+}
+
+/// Why head motion stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HeadMotionEnd {
+    /// No pod is in an ear any more; streaming resumes when worn again.
+    OffHead,
+    /// The AACP session that streamed motion died.
+    Disconnected,
+    /// The motion sensor never announced itself: another Apple device
+    /// shares the AirPods, the link needs a reconnect, or the model has none.
+    Unavailable,
 }
 
 /// Whether the charging case is open.
@@ -294,6 +336,36 @@ pub struct AACPManagerState {
     pub airpods_mac: Option<Address>,
     /// Broadcasts the opcode of every incoming packet for strict init sequencing.
     pub opcode_tx: tokio::sync::broadcast::Sender<u8>,
+    head_motion: HeadMotionState,
+}
+
+/// Head motion over RemoteHID for one session.
+#[derive(Default)]
+struct HeadMotionState {
+    /// A motion client wants samples from this session.
+    wanted: bool,
+    /// The sensor was started and not stopped since.
+    streaming: bool,
+    /// devmotion6's RemoteHID device id, from its announcement.
+    device: Option<u8>,
+    /// Counts the RemoteHID frames this host sent.
+    generation: u8,
+    /// Resends HostConnect, then reports motion unavailable, while
+    /// devmotion6 stays unannounced.
+    watchdog: Option<tokio::task::AbortHandle>,
+}
+
+impl HeadMotionState {
+    fn next_generation(&mut self) -> u8 {
+        self.generation = self.generation.wrapping_add(1);
+        self.generation
+    }
+}
+
+/// Off head: ear detection has reported, and no component is in an ear.
+fn off_head(left: Option<EarDetectionStatus>, right: Option<EarDetectionStatus>) -> bool {
+    matches!((left, right), (Some(l), Some(r))
+        if l != EarDetectionStatus::InEar && r != EarDetectionStatus::InEar)
 }
 
 impl AACPManagerState {
@@ -330,6 +402,49 @@ impl AACPManagerState {
             store_path,
             airpods_mac: None,
             opcode_tx: tokio::sync::broadcast::channel(16).0,
+            head_motion: HeadMotionState::default(),
+        }
+    }
+
+    fn emit(&self, event: AACPEvent) {
+        if let Some(tx) = &self.event_tx {
+            let _ = tx.send(event);
+        }
+    }
+
+    /// Queue a packet on the link; for callers already holding the state.
+    async fn send(&self, data: &[u8]) -> Result<()> {
+        if let Some(sender) = &self.sender {
+            sender.send(data.to_vec()).await.map_err(|e| {
+                error!("Failed to send packet to channel: {}", e);
+                Error::from(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "L2CAP send channel closed",
+                ))
+            })
+        } else {
+            error!("Cannot send packet, sender is not available.");
+            Err(Error::from(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "L2CAP stream not connected",
+            )))
+        }
+    }
+
+    /// Stop devmotion6 if it streams, and stop waiting for its announcement.
+    async fn disarm_head_motion(&mut self) {
+        if let Some(watchdog) = self.head_motion.watchdog.take() {
+            watchdog.abort();
+        }
+        if !std::mem::take(&mut self.head_motion.streaming) {
+            return;
+        }
+        if let Some(device) = self.head_motion.device {
+            info!("Stopping head motion on RemoteHID device {}", device);
+            let generation = self.head_motion.next_generation();
+            let _ = self
+                .send(&remote_hid::set_report_interval(generation, device, 0))
+                .await;
         }
     }
 }
@@ -374,6 +489,11 @@ impl AACPManager {
         }) {
             error!("Failed to set L2CAP security level: {}", e);
             return;
+        }
+        // Set before connect: the receive MTU is negotiated when the channel
+        // opens. Without it there is no head motion, but everything else works.
+        if let Err(e) = socket.set_recv_mtu(RECV_MTU) {
+            log::warn!("Failed to set L2CAP receive MTU {}: {}", RECV_MTU, e);
         }
 
         let seq_packet =
@@ -432,26 +552,29 @@ impl AACPManager {
     /// init drive their own retry.
     pub async fn disconnect(&self) {
         self.tasks.lock().await.abort_all();
-        self.state.lock().await.sender = None;
+        let mut state = self.state.lock().await;
+        state.sender = None;
+        if let Some(watchdog) = state.head_motion.watchdog.take() {
+            watchdog.abort();
+        }
+    }
+
+    /// The L2CAP session ended under us: end head motion for its clients,
+    /// then tell listeners so they can trigger a reconnect.
+    async fn connection_closed(&self) {
+        let mut state = self.state.lock().await;
+        state.sender = None;
+        if let Some(watchdog) = state.head_motion.watchdog.take() {
+            watchdog.abort();
+        }
+        if state.head_motion.wanted {
+            state.emit(AACPEvent::HeadMotionEnded(HeadMotionEnd::Disconnected));
+        }
+        state.emit(AACPEvent::ConnectionLost);
     }
 
     async fn send_packet(&self, data: &[u8]) -> Result<()> {
-        let state = self.state.lock().await;
-        if let Some(sender) = &state.sender {
-            sender.send(data.to_vec()).await.map_err(|e| {
-                error!("Failed to send packet to channel: {}", e);
-                Error::from(std::io::Error::new(
-                    std::io::ErrorKind::NotConnected,
-                    "L2CAP send channel closed",
-                ))
-            })
-        } else {
-            error!("Cannot send packet, sender is not available.");
-            Err(Error::from(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "L2CAP stream not connected",
-            )))
-        }
+        self.state.lock().await.send(data).await
     }
 
     async fn send_data_packet(&self, data: &[u8]) -> Result<()> {
@@ -694,6 +817,18 @@ impl AACPManager {
                         let _ = tx.send(AACPEvent::CaseLid(lid));
                     }
                 }
+
+                if state.head_motion.wanted {
+                    let was_off = off_head(old_left, old_right);
+                    let now_off = off_head(Some(left), Some(right));
+                    if now_off && !was_off {
+                        info!("AirPods off head: pausing head motion");
+                        state.disarm_head_motion().await;
+                        state.emit(AACPEvent::HeadMotionEnded(HeadMotionEnd::OffHead));
+                    } else if was_off && !now_off {
+                        self.arm_head_motion(&mut state).await;
+                    }
+                }
             }
             opcodes::CONVERSATION_AWARENESS => {
                 if packet.len() == 10 {
@@ -933,6 +1068,7 @@ impl AACPManager {
                     debug!("Smart-routing response (ignored): {}", packet_string);
                 }
             }
+            opcodes::REMOTE_HID => self.receive_remote_hid(packet).await,
             _ => debug!("Received unknown packet with opcode {:#04x}", opcode),
         }
     }
@@ -943,6 +1079,115 @@ impl AACPManager {
     pub async fn emit_event(&self, event: AACPEvent) {
         if let Some(ref tx) = self.state.lock().await.event_tx {
             let _ = tx.send(event);
+        }
+    }
+
+    /// Stream head motion from this session until `stop_head_motion`.
+    /// Samples and `HeadMotionEnded` arrive as events.
+    pub async fn start_head_motion(&self) {
+        let mut state = self.state.lock().await;
+        if state.head_motion.wanted {
+            return;
+        }
+        state.head_motion.wanted = true;
+        // Worn again, streaming resumes by itself (ear detection).
+        if off_head(state.ear_detection_left, state.ear_detection_right) {
+            state.emit(AACPEvent::HeadMotionEnded(HeadMotionEnd::OffHead));
+            return;
+        }
+        self.arm_head_motion(&mut state).await;
+    }
+
+    /// Stop streaming head motion.
+    pub async fn stop_head_motion(&self) {
+        let mut state = self.state.lock().await;
+        state.head_motion.wanted = false;
+        state.disarm_head_motion().await;
+    }
+
+    /// Start devmotion6, or ask the AirPods to announce it first.
+    async fn arm_head_motion(&self, state: &mut AACPManagerState) {
+        if let Some(device) = state.head_motion.device {
+            info!("Starting head motion on RemoteHID device {}", device);
+            let generation = state.head_motion.next_generation();
+            let _ = state
+                .send(&remote_hid::set_report_interval(
+                    generation,
+                    device,
+                    HEAD_MOTION_INTERVAL_US,
+                ))
+                .await;
+            state.head_motion.streaming = true;
+            return;
+        }
+        if state.head_motion.watchdog.is_some() {
+            return; // HostConnect sent, announcements pending
+        }
+        let generation = state.head_motion.next_generation();
+        let _ = state.send(&remote_hid::host_connect(generation)).await;
+        state.head_motion.watchdog = Some(self.spawn_announcement_watchdog());
+    }
+
+    /// Resend HostConnect once, then report motion unavailable, unless
+    /// devmotion6 announces itself first (which aborts this).
+    fn spawn_announcement_watchdog(&self) -> tokio::task::AbortHandle {
+        let manager = self.clone();
+        tokio::spawn(async move {
+            sleep(HOST_CONNECT_RETRY).await;
+            {
+                let mut state = manager.state.lock().await;
+                info!("No head motion sensor announced yet; resending HostConnect");
+                let generation = state.head_motion.next_generation();
+                let _ = state.send(&remote_hid::host_connect(generation)).await;
+            }
+            sleep(MOTION_ANNOUNCE_TIMEOUT - HOST_CONNECT_RETRY).await;
+            let mut state = manager.state.lock().await;
+            state.head_motion.watchdog = None;
+            log::warn!(
+                "The AirPods announced no head motion sensor: disconnect other Apple devices \
+                 from them, or disconnect and reconnect the AirPods"
+            );
+            state.emit(AACPEvent::HeadMotionEnded(HeadMotionEnd::Unavailable));
+        })
+        .abort_handle()
+    }
+
+    async fn receive_remote_hid(&self, packet: &[u8]) {
+        let mut state = self.state.lock().await;
+        for sub in remote_hid::parse_frame(packet) {
+            match sub {
+                SubPacket::DeviceConnect { device, service } => {
+                    debug!("RemoteHID device {} announced: {}", device, service);
+                    if service != HEAD_MOTION_SERVICE {
+                        continue;
+                    }
+                    let again = state.head_motion.device.replace(device).is_some();
+                    info!(
+                        "Head motion sensor is RemoteHID device {}{}",
+                        device,
+                        if again { " (re-announced)" } else { "" }
+                    );
+                    if let Some(watchdog) = state.head_motion.watchdog.take() {
+                        watchdog.abort();
+                    }
+                    // A re-announcement cancels a running stream: re-arm it.
+                    // Off head, ear detection re-arms it when worn again.
+                    if state.head_motion.wanted
+                        && !off_head(state.ear_detection_left, state.ear_detection_right)
+                    {
+                        self.arm_head_motion(&mut state).await;
+                    }
+                }
+                SubPacket::InputReport { device, report } => {
+                    if state.head_motion.streaming
+                        && state.head_motion.device == Some(device)
+                        && let Some(sample) = remote_hid::decode_motion(report)
+                    {
+                        state.emit(AACPEvent::HeadMotion(sample));
+                    }
+                }
+                SubPacket::Other { .. } => {}
+            }
         }
     }
 
@@ -1252,7 +1497,7 @@ async fn save_device_entry(path: &std::path::Path, mac: &str, data: &DeviceData)
 }
 
 async fn recv_thread(manager: AACPManager, sp: Arc<SeqPacket>) {
-    let mut buf = vec![0u8; 1024];
+    let mut buf = vec![0u8; usize::from(RECV_MTU)];
     loop {
         match sp.recv(&mut buf).await {
             Ok(0) => {
@@ -1261,10 +1506,13 @@ async fn recv_thread(manager: AACPManager, sp: Arc<SeqPacket>) {
             }
             Ok(n) => {
                 let data = &buf[..n];
-                if data.get(4) == Some(&opcodes::PROXIMITY_KEYS_RSP) {
-                    debug!("Received {} bytes: proximity keys (redacted)", n);
-                } else {
-                    debug!("Received {} bytes: {}", n, hex::encode(data));
+                match data.get(4) {
+                    Some(&opcodes::PROXIMITY_KEYS_RSP) => {
+                        debug!("Received {} bytes: proximity keys (redacted)", n)
+                    }
+                    // 50 per second while head motion streams.
+                    Some(&opcodes::REMOTE_HID) => {}
+                    _ => debug!("Received {} bytes: {}", n, hex::encode(data)),
                 }
                 manager.receive_packet(data).await;
             }
@@ -1280,12 +1528,7 @@ async fn recv_thread(manager: AACPManager, sp: Arc<SeqPacket>) {
             }
         }
     }
-    let mut state = manager.state.lock().await;
-    state.sender = None;
-    // Notify listeners that the L2CAP connection is gone so they can trigger reconnect
-    if let Some(tx) = &state.event_tx {
-        let _ = tx.send(AACPEvent::ConnectionLost);
-    }
+    manager.connection_closed().await;
 }
 
 async fn send_thread(mut rx: mpsc::Receiver<Vec<u8>>, sp: Arc<SeqPacket>) {
@@ -2145,5 +2388,252 @@ mod tests {
         assert!(find(b"\x48idleTime\x30\x00"));
         assert!(find(b"\x47newTipi\x01"));
         assert!(find(b"\x50nearbyAudioScore\x30\x01"));
+    }
+
+    // ── Head motion over RemoteHID ──
+
+    /// devmotion6 announced as RemoteHID device 4 (as on the AirPods Max).
+    const ANNOUNCE_DEVMOTION6: &str = "040004001700000800005a0000010000042b00003c706c6973743e3c646963743e3c6b65793e4163636573736f7279536572766963653c2f6b65793e3c737472696e673e6465766d6f74696f6e363c2f737472696e673e3c2f646963743e3c2f706c6973743e";
+    /// gyro announced as device 5.
+    const ANNOUNCE_GYRO: &str = "04000400170000080000540000010000052800003c706c6973743e3c646963743e3c6b65793e4163636573736f7279536572766963653c2f6b65793e3c737472696e673e6779726f3c2f737472696e673e3c2f646963743e3c2f706c6973743e";
+    /// An input report from device 4 carrying the captured AirPods 3 motion
+    /// block of `remote_hid`'s tests.
+    const MOTION_REPORT: &str = "04000400170000080000430000010000841f040000011875f5bd770600000300035b670c10000000004f01312dc10847ff0400b9001e001d001e007bfdaa0000fee102ecff1dfd5e66743d41cb0000";
+    /// The captured block's sample.
+    const CAPTURED_SAMPLE: HeadMotionSample = HeadMotionSample {
+        timestamp_ns: 7_111_357_855_000,
+        quaternion: [0.933_042_6, 0.010_223_389, 0.353_057_86, 0.068_389_89],
+    };
+
+    fn frame(hex_str: &str) -> Vec<u8> {
+        hex::decode(hex_str.replace(' ', "")).unwrap()
+    }
+
+    /// A manager with an event channel and a link whose sent packets the
+    /// test reads.
+    async fn manager_with_link() -> (
+        AACPManager,
+        UnboundedReceiver<AACPEvent>,
+        mpsc::Receiver<Vec<u8>>,
+    ) {
+        let (m, events) = manager_with_events().await;
+        let (tx, sent) = mpsc::channel(16);
+        m.state.lock().await.sender = Some(tx);
+        (m, events, sent)
+    }
+
+    /// The next head-motion event, skipping everything else.
+    async fn next_motion_event(rx: &mut UnboundedReceiver<AACPEvent>) -> Option<AACPEvent> {
+        while let Some(ev) = next_event(rx).await {
+            if matches!(ev, AACPEvent::HeadMotion(_) | AACPEvent::HeadMotionEnded(_)) {
+                return Some(ev);
+            }
+        }
+        None
+    }
+
+    fn assert_sample(event: Option<AACPEvent>, expected: HeadMotionSample) {
+        let Some(AACPEvent::HeadMotion(sample)) = event else {
+            panic!("expected a sample, got {event:?}");
+        };
+        assert_eq!(sample.timestamp_ns, expected.timestamp_ns);
+        for (a, e) in sample.quaternion.iter().zip(expected.quaternion) {
+            assert!((a - e).abs() < 1e-6, "{:?}", sample.quaternion);
+        }
+    }
+
+    #[tokio::test]
+    async fn head_motion_starts_the_announced_sensor_and_emits_its_samples() {
+        let (m, mut events, mut sent) = manager_with_link().await;
+        m.start_head_motion().await;
+        // HostConnect, generation 1.
+        assert_eq!(
+            sent.try_recv().unwrap(),
+            frame("040004001700000800000800 00010000 00020000")
+        );
+
+        m.receive_packet(&frame(ANNOUNCE_GYRO)).await;
+        assert!(sent.try_recv().is_err(), "only devmotion6 is started");
+        m.receive_packet(&frame(ANNOUNCE_DEVMOTION6)).await;
+        // SetReport on device 4: feature report 1 = 20 000 µs (50 Hz).
+        assert_eq!(
+            sent.try_recv().unwrap(),
+            frame("040004001700000800000e00 00020000 04050600 0201204e0000")
+        );
+
+        m.receive_packet(&frame(MOTION_REPORT)).await;
+        assert_sample(next_motion_event(&mut events).await, CAPTURED_SAMPLE);
+    }
+
+    /// Start and let devmotion6 announce itself as device 4; drain the
+    /// packets this sent.
+    async fn streaming_manager() -> (
+        AACPManager,
+        UnboundedReceiver<AACPEvent>,
+        mpsc::Receiver<Vec<u8>>,
+    ) {
+        let (m, events, mut sent) = manager_with_link().await;
+        m.start_head_motion().await;
+        m.receive_packet(&frame(ANNOUNCE_DEVMOTION6)).await;
+        while sent.try_recv().is_ok() {}
+        (m, events, sent)
+    }
+
+    #[tokio::test]
+    async fn stopping_head_motion_stops_the_sensor_and_drops_late_samples() {
+        let (m, mut events, mut sent) = streaming_manager().await;
+        m.stop_head_motion().await;
+        // SetReport on device 4 with interval 0, generation 3.
+        assert_eq!(
+            sent.try_recv().unwrap(),
+            frame("040004001700000800000e00 00030000 04050600 020100000000")
+        );
+        m.receive_packet(&frame(MOTION_REPORT)).await;
+        assert!(next_motion_event(&mut events).await.is_none());
+
+        // The sensor is known now: starting again needs no HostConnect.
+        m.start_head_motion().await;
+        assert_eq!(
+            sent.try_recv().unwrap(),
+            frame("040004001700000800000e00 00040000 04050600 0201204e0000")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reannounced_sensor_is_started_again() {
+        let (m, _events, mut sent) = streaming_manager().await;
+        m.receive_packet(&frame(ANNOUNCE_DEVMOTION6)).await;
+        assert_eq!(
+            sent.try_recv().unwrap(),
+            frame("040004001700000800000e00 00030000 04050600 0201204e0000")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_announcement_without_demand_starts_nothing() {
+        let (m, mut events, mut sent) = manager_with_link().await;
+        m.receive_packet(&frame(ANNOUNCE_DEVMOTION6)).await;
+        m.receive_packet(&frame(MOTION_REPORT)).await;
+        assert!(sent.try_recv().is_err());
+        assert!(next_motion_event(&mut events).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn taking_the_airpods_off_ends_motion_and_wearing_them_resumes_it() {
+        let (m, mut events, mut sent) = manager_with_link().await;
+        // Worn: both components InEar, as the Max report.
+        m.receive_packet(&pkt(&[opcodes::EAR_DETECTION, 0x00, 0x00, 0x00]))
+            .await;
+        m.start_head_motion().await;
+        m.receive_packet(&frame(ANNOUNCE_DEVMOTION6)).await;
+        while sent.try_recv().is_ok() {}
+
+        // Off head: nothing InEar.
+        m.receive_packet(&pkt(&[opcodes::EAR_DETECTION, 0x00, 0x01, 0x01]))
+            .await;
+        assert!(matches!(
+            next_motion_event(&mut events).await,
+            Some(AACPEvent::HeadMotionEnded(HeadMotionEnd::OffHead))
+        ));
+        assert_eq!(
+            sent.try_recv().unwrap(),
+            frame("040004001700000800000e00 00030000 04050600 020100000000")
+        );
+
+        // One cup back on: streaming resumes on its own.
+        m.receive_packet(&pkt(&[opcodes::EAR_DETECTION, 0x00, 0x00, 0x01]))
+            .await;
+        assert_eq!(
+            sent.try_recv().unwrap(),
+            frame("040004001700000800000e00 00040000 04050600 0201204e0000")
+        );
+        m.receive_packet(&frame(MOTION_REPORT)).await;
+        assert_sample(next_motion_event(&mut events).await, CAPTURED_SAMPLE);
+    }
+
+    #[tokio::test]
+    async fn starting_while_off_head_reports_off_head_and_waits_to_be_worn() {
+        let (m, mut events, mut sent) = manager_with_link().await;
+        m.receive_packet(&pkt(&[opcodes::EAR_DETECTION, 0x00, 0x01, 0x01]))
+            .await;
+        m.start_head_motion().await;
+        assert!(matches!(
+            next_motion_event(&mut events).await,
+            Some(AACPEvent::HeadMotionEnded(HeadMotionEnd::OffHead))
+        ));
+        assert!(sent.try_recv().is_err());
+        m.receive_packet(&pkt(&[opcodes::EAR_DETECTION, 0x00, 0x00, 0x00]))
+            .await;
+        // HostConnect, generation 1.
+        assert_eq!(
+            sent.try_recv().unwrap(),
+            frame("040004001700000800000800 00010000 00020000")
+        );
+    }
+
+    /// AirPods sharing their link with another Apple device announce no
+    /// sensors at all.
+    #[tokio::test(start_paused = true)]
+    async fn a_sensor_that_never_announces_itself_is_reported_unavailable() {
+        let (m, mut events, mut sent) = manager_with_link().await;
+        m.start_head_motion().await;
+        assert_eq!(
+            sent.try_recv().unwrap(),
+            frame("040004001700000800000800 00010000 00020000")
+        );
+
+        sleep(Duration::from_millis(1_900)).await;
+        assert!(sent.try_recv().is_err());
+        sleep(Duration::from_millis(200)).await;
+        // HostConnect once more, generation 2.
+        assert_eq!(
+            sent.try_recv().unwrap(),
+            frame("040004001700000800000800 00020000 00020000")
+        );
+
+        sleep(Duration::from_millis(2_800)).await;
+        assert!(events.try_recv().is_err());
+        sleep(Duration::from_millis(200)).await;
+        assert!(matches!(
+            events.try_recv(),
+            Ok(AACPEvent::HeadMotionEnded(HeadMotionEnd::Unavailable))
+        ));
+        assert!(sent.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_announcement_in_time_cancels_the_unavailable_report() {
+        let (m, mut events, mut sent) = manager_with_link().await;
+        m.start_head_motion().await;
+        sleep(Duration::from_secs(1)).await;
+        m.receive_packet(&frame(ANNOUNCE_DEVMOTION6)).await;
+        sleep(Duration::from_secs(10)).await;
+        // HostConnect, then the SetReport start: no resend.
+        assert_eq!(sent.try_recv().unwrap()[10..12], [0x08, 0x00]);
+        assert_eq!(sent.try_recv().unwrap()[10..12], [0x0e, 0x00]);
+        assert!(sent.try_recv().is_err());
+        assert!(events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_lost_link_ends_motion_before_reporting_the_loss() {
+        let (m, mut events, _sent) = streaming_manager().await;
+        m.connection_closed().await;
+        assert!(matches!(
+            next_event(&mut events).await,
+            Some(AACPEvent::HeadMotionEnded(HeadMotionEnd::Disconnected))
+        ));
+        assert!(matches!(
+            next_event(&mut events).await,
+            Some(AACPEvent::ConnectionLost)
+        ));
+
+        // A session nobody asked motion from reports only the loss.
+        let (m, mut events, _sent) = manager_with_link().await;
+        m.connection_closed().await;
+        assert!(matches!(
+            next_event(&mut events).await,
+            Some(AACPEvent::ConnectionLost)
+        ));
     }
 }
